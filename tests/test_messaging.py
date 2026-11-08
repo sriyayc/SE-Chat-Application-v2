@@ -107,7 +107,7 @@ def test_cannot_message_yourself(connect):
     assert alice.reply_to(send(alice, "Alice", "me"))["code"] == "INVALID_MESSAGE"
 
 
-def test_room_messages_not_available_yet(connect):
+def test_room_message_needs_membership(connect):
     alice = connect().sign_in("alice")
     reply = alice.reply_to(
         alice.request("MSG", {"room": "general", "text": "hi"})
@@ -136,6 +136,14 @@ def test_invalid_message_is_rejected_and_others_unaffected(connect):
     seq = send(alice, "bob", "still working")
     assert bob.recv()["data"]["text"] == "still working"
     assert alice.reply_to(seq)["status"] == "DELIVERED"
+
+
+def next_non_notification(inbox):
+    """Next item from a client inbox, skipping presence and room notifications."""
+    while True:
+        item = inbox.get(timeout=5)
+        if item[0] != "message" or item[1].get("kind") not in ("presence", "room", "join", "leave"):
+            return item
 
 
 def test_two_client_network_handlers_chat(server_address):
@@ -171,10 +179,10 @@ def test_two_client_network_handlers_chat(server_address):
             {"to": "bob", "text": "hello from a real client"},
         )
 
-        _, ack, request_type = inbox_a.get(timeout=5)
+        _, ack, request_type = next_non_notification(inbox_a)
         assert (request_type, ack["status"]) == ("MSG", "DELIVERED")
 
-        _, event, _ = inbox_b.get(timeout=5)
+        _, event, _ = next_non_notification(inbox_b)
         assert event["data"]["text"] == "hello from a real client"
 
     finally:

@@ -45,8 +45,22 @@ class RawClient:
         self.send(message)
         return self._seq
 
-    def recv(self):
-        return read_frame(self.sock, 1 << 20)
+    # Notifications most tests do not care about (presence, rooms, join/leave).
+    NOTIFICATIONS = frozenset({"presence", "room", "join", "leave"})
+
+    def recv(self, notifications=False):
+        """Read the next message, skipping notification events unless asked for them."""
+        while True:
+            message = read_frame(self.sock, 1 << 20)
+            if notifications or message.get("kind") not in self.NOTIFICATIONS:
+                return message
+
+    def next_event(self, kind):
+        """Read until an EVENT of the given kind arrives."""
+        while True:
+            message = self.recv(notifications=True)
+            if message.get("type") == "EVENT" and message.get("kind") == kind:
+                return message
 
     def reply_to(self, seq):
         """Read until the ACK/ERROR for seq arrives, skipping events."""

@@ -1,13 +1,15 @@
 """Tkinter chat client: login/registration screen, chat screen and connection status bar.
 
-Tkinter must only be touched from the main thread (SAD risk R8). The network handler
-and the connect worker put events on a queue, and _poll drains it every 50 ms.
+The chat screen has a sidebar with the rooms and the users who are online, and one
+conversation per room or person. Tkinter must only be touched from the main thread
+(SAD risk R8): the network handler and the connect worker put events on a queue,
+and _poll drains it every 50 ms.
 """
 import queue
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk
+from tkinter import simpledialog, ttk
 
 from client.net.connection import ChatConnection
 
@@ -18,10 +20,11 @@ STATUS_COLOURS = {"connected": "#1a7f37", "busy": "#9a6700", "offline": "#cf222e
 
 FRIENDLY_ERRORS = {
     "AUTH_FAILED": "Login failed. Check your username and password.",
-    "DUPLICATE": "That username is already taken.",
     "SESSION_EXPIRED": "Your session has expired. Please log in again.",
     "SERVER_BUSY": "The server is full. Try again in a moment.",
 }
+
+ROOM, USER = "room", "user"
 
 
 def describe_error(message):
@@ -34,6 +37,11 @@ def clock(ts):
     return time.strftime("%H:%M", time.localtime(ts))
 
 
+def conversation_title(conversation):
+    kind, name = conversation
+    return f"# {name}" if kind == ROOM else name
+
+
 class ChatApp:
     def __init__(self, root, host="127.0.0.1", port=5050):
         self.root = root
@@ -43,19 +51,26 @@ class ChatApp:
         self.on_connected = None      # what to send once the connect worker succeeds
         self.pending_login = None     # credentials to log in with after REGISTER succeeds
         self.logging_out = False
-        self.last_seq = {}            # sender -> last seq seen, to check ordering (CHAT-F-008)
+        self.last_seq = {}            # (conversation, sender) -> last seq seen (CHAT-F-008)
+        self.online = set()
+        self.rooms = {}               # room name -> {"joined": bool, "members": int, "status": str}
+        self.lines = {}               # conversation -> [(text, tag, meta)]
+        self.unread = set()
+        self.current = None           # (ROOM, name) or (USER, name)
+        self._room_names = []         # what each sidebar row shows, in order
+        self._user_names = []
 
         root.title("Chat")
-        root.minsize(560, 440)
+        root.minsize(720, 460)
         root.protocol("WM_DELETE_WINDOW", self.quit)
 
         self.host_var = tk.StringVar(value=host)
         self.port_var = tk.StringVar(value=str(port))
         self.user_var = tk.StringVar()
         self.password_var = tk.StringVar()
-        self.to_var = tk.StringVar()
         self.text_var = tk.StringVar()
         self.status_var = tk.StringVar()
+        self.title_var = tk.StringVar()
 
         self._build_status_bar()
         self._build_login()
@@ -100,16 +115,38 @@ class ChatApp:
     def _build_chat(self):
         self.chat_frame = frame = ttk.Frame(self.root, padding=10)
 
-        top = ttk.Frame(frame)
+        sidebar = ttk.Frame(frame, width=210)
+        sidebar.pack(side="left", fill="y", padx=(0, 10))
+        sidebar.pack_propagate(False)
+        ttk.Label(sidebar, text="Rooms", font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
+        self.room_list = tk.Listbox(sidebar, height=8, activestyle="none", exportselection=False)
+        self.room_list.pack(fill="both", expand=True, pady=(2, 4))
+        self.room_list.bind("<<ListboxSelect>>", lambda _e: self._open_selected_room())
+        room_buttons = ttk.Frame(sidebar)
+        room_buttons.pack(fill="x")
+        for column, (text, command) in enumerate((("New", self.ask_new_room), ("Join", self.join_selected_room),
+                                                  ("Leave", self.leave_selected_room))):
+            ttk.Button(room_buttons, text=text, width=1, command=command).grid(
+                row=0, column=column, sticky="ew", padx=(0 if column == 0 else 4, 0))
+            room_buttons.columnconfigure(column, weight=1)
+
+        # Packed before the user list so it keeps its space when the window is small.
+        ttk.Button(sidebar, text="Message someone…", command=self.ask_direct_message).pack(side="bottom", fill="x")
+        ttk.Label(sidebar, text="Online", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(12, 0))
+        self.user_list = tk.Listbox(sidebar, height=8, activestyle="none", exportselection=False)
+        self.user_list.pack(fill="both", expand=True, pady=(2, 4))
+        self.user_list.bind("<<ListboxSelect>>", lambda _e: self._open_selected_user())
+
+        main = ttk.Frame(frame)
+        main.pack(side="left", fill="both", expand=True)
+        top = ttk.Frame(main)
         top.pack(fill="x")
-        ttk.Label(top, text="To:").pack(side="left")
-        self.to_entry = ttk.Entry(top, textvariable=self.to_var, width=24)
-        self.to_entry.pack(side="left", padx=(6, 0))
+        ttk.Label(top, textvariable=self.title_var, font=("TkDefaultFont", 11, "bold")).pack(side="left")
         self.logout_button = ttk.Button(top, text="Log out", command=self.logout)
         self.logout_button.pack(side="right")
 
         # Packed before the message log so the input row keeps its space when the window is small.
-        bottom = ttk.Frame(frame)
+        bottom = ttk.Frame(main)
         bottom.pack(side="bottom", fill="x")
         self.message_entry = ttk.Entry(bottom, textvariable=self.text_var)
         self.message_entry.pack(side="left", fill="x", expand=True)
@@ -117,7 +154,7 @@ class ChatApp:
         self.send_button = ttk.Button(bottom, text="Send", command=self.send_message)
         self.send_button.pack(side="left", padx=(8, 0))
 
-        body = ttk.Frame(frame)
+        body = ttk.Frame(main)
         body.pack(fill="both", expand=True, pady=8)
         self.log = tk.Text(body, wrap="word", state="disabled", height=12, padx=8, pady=6,
                            relief="solid", borderwidth=1, font=("TkDefaultFont", 10))
@@ -130,7 +167,6 @@ class ChatApp:
         self.log.tag_configure("meta", font=("TkDefaultFont", 8), foreground="#6e7781")
         self.log.tag_configure("system", justify="center", foreground="#6e7781", font=("TkDefaultFont", 9, "italic"))
         self.log.tag_configure("warning", justify="center", foreground="#9a6700", font=("TkDefaultFont", 9, "italic"))
-
 
     # ---------- screens and status ----------
 
@@ -146,10 +182,10 @@ class ChatApp:
         self.chat_frame.pack(fill="both", expand=True)
         self.root.title(f"Chat — {self.username}")
         self.password_var.set("")
-        self.last_seq.clear()
-        self._clear_log()
-        self.add_line(f"Logged in as {self.username}. Enter a username in To: and start chatting.", "system")
-        (self.to_entry if not self.to_var.get() else self.message_entry).focus_set()
+        self.current = None
+        self.title_var.set("")
+        self._render()
+        self.add_line(f"Logged in as {self.username}. Pick a room or a person on the left.", "system")
 
     def set_status(self, text, state):
         self.status_var.set(text)
@@ -160,20 +196,92 @@ class ChatApp:
         for widget in (self.login_button, self.register_button, *self.login_entries):
             widget.configure(state=state)
 
-    # ---------- chat log ----------
+    # ---------- sidebar ----------
 
-    def _clear_log(self):
+    def _refresh_sidebar(self):
+        self._room_names = sorted(self.rooms, key=str.casefold)
+        self.room_list.delete(0, "end")
+        for name in self._room_names:
+            info = self.rooms[name]
+            mark = "• " if (ROOM, name) in self.unread else ("✓ " if info["joined"] else "   ")
+            lock = " (read-only)" if info["status"] == "RESTRICTED" else ""
+            self.room_list.insert("end", f"{mark}#{name}  ({info['members']}){lock}")
+        self._user_names = sorted(self.online - {self.username}, key=str.casefold)
+        self.user_list.delete(0, "end")
+        for name in self._user_names:
+            mark = "• " if (USER, name) in self.unread else "   "
+            self.user_list.insert("end", mark + name)
+
+    def _selected(self, listbox, names):
+        selection = listbox.curselection()
+        return names[selection[0]] if selection else None
+
+    def _open_selected_room(self):
+        name = self._selected(self.room_list, self._room_names)
+        if name is not None:
+            self.open_conversation(ROOM, name)
+
+    def _open_selected_user(self):
+        name = self._selected(self.user_list, self._user_names)
+        if name is not None:
+            self.open_conversation(USER, name)
+
+    def ask_new_room(self):
+        name = simpledialog.askstring("New room", "Room name:", parent=self.root)
+        if name and name.strip():
+            self.create_room(name.strip())
+
+    def ask_direct_message(self):
+        name = simpledialog.askstring("Message someone", "Username:", parent=self.root)
+        if name and name.strip():
+            self.open_conversation(USER, name.strip())
+
+    def join_selected_room(self):
+        name = self._selected(self.room_list, self._room_names)
+        if name is not None:
+            self.join_room(name)
+
+    def leave_selected_room(self):
+        name = self._selected(self.room_list, self._room_names)
+        if name is not None:
+            self.leave_room(name)
+
+    # ---------- conversations ----------
+
+    def open_conversation(self, kind, name):
+        self.current = (kind, name)
+        self.unread.discard(self.current)
+        self.title_var.set(conversation_title(self.current))
+        self._render()
+        self._refresh_sidebar()
+        if kind == ROOM and not self.rooms.get(name, {}).get("joined"):
+            self.add_line(f"You are not in #{name}. Click Join to take part.", "system")
+        self.message_entry.focus_set()
+
+    def _render(self):
         self.log.configure(state="normal")
         self.log.delete("1.0", "end")
         self.log.configure(state="disabled")
+        for text, tag, meta in self.lines.get(self.current, []):
+            self._insert(text, tag, meta)
 
-    def add_line(self, text, tag, meta=None):
+    def _insert(self, text, tag, meta):
         self.log.configure(state="normal")
         if meta:
             self.log.insert("end", meta + "\n", (tag, "meta"))
         self.log.insert("end", text + "\n\n" if meta else text + "\n", tag)
         self.log.configure(state="disabled")
         self.log.see("end")
+
+    def add_line(self, text, tag, meta=None, conversation=None):
+        """Add a line to a conversation (the current one by default), showing it if it is open."""
+        conversation = conversation or self.current
+        self.lines.setdefault(conversation, []).append((text, tag, meta))
+        if conversation == self.current:
+            self._insert(text, tag, meta)
+        elif conversation is not None and tag in ("them", "warning"):
+            self.unread.add(conversation)
+            self._refresh_sidebar()
 
     # ---------- user actions ----------
 
@@ -223,24 +331,38 @@ class ChatApp:
 
         threading.Thread(target=worker, name="connect", daemon=True).start()
 
+    def _request(self, message_type, payload):
+        try:
+            self.conn.request(message_type, payload)
+            return True
+        except (OSError, AttributeError):
+            self.add_line("Not connected: the request was not sent.", "warning")
+            return False
+
+    def create_room(self, name):
+        self._request("CREATE_ROOM", {"room": name})
+
+    def join_room(self, name):
+        self._request("JOIN", {"room": name})
+
+    def leave_room(self, name):
+        self._request("LEAVE", {"room": name})
+
     def send_message(self):
-        to, text = self.to_var.get().strip(), self.text_var.get()
+        text = self.text_var.get()
         if not text.strip():
             return
-        if not to:
-            self.add_line("Enter who the message is for in To:.", "warning")
-            self.to_entry.focus_set()
+        if self.current is None:
+            self.add_line("Pick a room or a person on the left first.", "warning")
             return
         if len(text) > MAX_TEXT_CHARS:
             self.add_line(f"Messages can be at most {MAX_TEXT_CHARS} characters.", "warning")
             return
-        try:
-            self.conn.request("MSG", {"to": to, "text": text})
-        except OSError:
-            self.add_line("Not connected: the message was not sent.", "warning")
+        kind, name = self.current
+        if not self._request("MSG", {kind if kind == ROOM else "to": name, "text": text}):
             return
         self.text_var.set("")
-        self.add_line(text, "me", meta=f"You → {to}  {clock(time.time())}")
+        self.add_line(text, "me", meta=f"You  {clock(time.time())}")
 
     def logout(self):
         if self.conn is None or not self.conn.connected:
@@ -263,6 +385,12 @@ class ChatApp:
             self.conn = None
         self.username = None
         self.logging_out = False
+        self.online.clear()
+        self.rooms.clear()
+        self.lines.clear()
+        self.unread.clear()
+        self.last_seq.clear()
+        self.current = None
         self.set_status("Not connected", "offline")
         self.show_login(message, colour)
 
@@ -305,8 +433,8 @@ class ChatApp:
             self._handle_ack(message, request_type)
         elif mtype == "ERROR":
             self._handle_error(message, request_type)
-        elif mtype == "EVENT" and message.get("kind") == "msg":
-            self._show_incoming(message["data"])
+        elif mtype == "EVENT":
+            self._handle_event(message.get("kind"), message.get("data", {}))
 
     def _handle_ack(self, message, request_type):
         status, data = message.get("status"), message.get("data", {})
@@ -318,12 +446,30 @@ class ChatApp:
                 self.conn.request("LOGIN", credentials)
         elif request_type == "LOGIN":
             self.username = data.get("username")
+            self.online = set(data.get("online", []))
+            self.rooms = {r["name"]: {"joined": r["joined"], "members": r["members"], "status": r["status"]}
+                          for r in data.get("rooms", [])}
             self.set_status(f"Connected as {self.username}", "connected")
             self.show_chat()
+            self._refresh_sidebar()
         elif request_type == "LOGOUT":
             self._back_to_login("You have logged out.", "connected")
+        elif request_type in ("CREATE_ROOM", "JOIN"):
+            name = data["room"]
+            self.rooms[name] = {**self.rooms.get(name, {"status": "OPEN"}),
+                                "joined": True, "members": len(data.get("members", []))}
+            self.open_conversation(ROOM, name)
+            verb = "created" if request_type == "CREATE_ROOM" else "joined"
+            self.add_line(f"You {verb} #{name}. Members: {', '.join(data.get('members', []))}", "system")
+        elif request_type == "LEAVE":
+            name = data["room"]
+            info = self.rooms.setdefault(name, {"status": "OPEN", "members": 1})
+            info.update(joined=False, members=max(0, info["members"] - 1))
+            self.add_line(f"You left #{name}.", "system", conversation=(ROOM, name))
+            self._refresh_sidebar()
         elif request_type == "MSG" and status == "NOT_DELIVERED":
-            self.add_line(f"{data.get('to')} is offline — your message was not delivered.", "warning")
+            target = (ROOM, data["room"]) if "room" in data else (USER, data.get("to"))
+            self.add_line(f"{data.get('reason')} — your message was not delivered.", "warning", conversation=target)
 
     def _handle_error(self, message, request_type):
         text = describe_error(message)
@@ -331,17 +477,45 @@ class ChatApp:
             self._back_to_login(text)
         elif self.username is None:
             self.pending_login = None
+            if message.get("code") == "DUPLICATE":
+                text = "That username is already taken."
             self.show_login(text)
         else:
             self.add_line(text, "warning")
 
+    def _handle_event(self, kind, data):
+        if kind == "msg":
+            self._show_incoming(data)
+        elif kind == "presence":
+            user = data.get("user")
+            if data.get("status") == "online":
+                self.online.add(user)
+            else:
+                self.online.discard(user)
+            if (USER, user) in self.lines:
+                self.add_line(f"{user} is now {data.get('status')}.", "system", conversation=(USER, user))
+            self._refresh_sidebar()
+        elif kind == "room" and data.get("action") == "created":
+            self.rooms.setdefault(data["room"], {"joined": False, "members": 1, "status": "OPEN"})
+            self._refresh_sidebar()
+        elif kind in ("join", "leave"):
+            name, user = data.get("room"), data.get("user")
+            info = self.rooms.setdefault(name, {"joined": True, "members": 0, "status": "OPEN"})
+            info["members"] = max(0, info["members"] + (1 if kind == "join" else -1))
+            verb = "joined" if kind == "join" else "left"
+            self.add_line(f"{user} {verb} the room.", "system", conversation=(ROOM, name))
+            self._refresh_sidebar()
+
     def _show_incoming(self, data):
         sender, seq = data.get("from"), data.get("seq")
-        last = self.last_seq.get(sender)
+        conversation = (ROOM, data["room"]) if "room" in data else (USER, sender)
+        key = (conversation, sender)
+        last = self.last_seq.get(key)
         if isinstance(seq, int):
             if last is not None and seq <= last:
-                self.add_line(f"Message from {sender} arrived out of order.", "warning")
-            self.last_seq[sender] = seq
-        self.add_line(data.get("text", ""), "them", meta=f"{sender}  {clock(data.get('ts', time.time()))}")
-        if not self.to_var.get().strip():
-            self.to_var.set(sender)
+                self.add_line(f"Message from {sender} arrived out of order.", "warning", conversation=conversation)
+            self.last_seq[key] = seq
+        if self.current is None:
+            self.open_conversation(*conversation)
+        self.add_line(data.get("text", ""), "them",
+                      meta=f"{sender}  {clock(data.get('ts', time.time()))}", conversation=conversation)

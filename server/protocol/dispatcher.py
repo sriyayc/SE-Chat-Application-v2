@@ -4,23 +4,28 @@ import logging
 from server.protocol import messages
 from server.protocol.validator import PRE_LOGIN_TYPES, ValidationError, validate
 from server.services.auth import AuthError
+from server.services.rooms import RoomError
 
 log = logging.getLogger(__name__)
 
 
 class Dispatcher:
-    def __init__(self, config, auth, sessions, presence, router):
+    def __init__(self, config, auth, sessions, presence, router, rooms):
         self.max_text_chars = config["max_text_chars"]
         self.auth = auth
         self.sessions = sessions
         self.presence = presence
         self.router = router
+        self.rooms = rooms
         self._handlers = {
             "PING": self._ping,
             "REGISTER": self._register,
             "LOGIN": self._login,
             "LOGOUT": self._logout,
             "MSG": self._msg,
+            "CREATE_ROOM": self._create_room,
+            "JOIN": self._join,
+            "LEAVE": self._leave,
         }
 
     def handle(self, conn, message):
@@ -77,7 +82,8 @@ class Dispatcher:
         conn.set_authenticated()
         log.info("%r logged in as %r", conn, user["username"])
         conn.send(messages.ack(request.seq, "LOGGED_IN", {
-            "session": conn.session.token, "username": user["username"], "role": user["role"]}))
+            "session": conn.session.token, "username": user["username"], "role": user["role"],
+            "online": self.presence.online_users(), "rooms": self.rooms.room_list(user)}))
 
     def _logout(self, conn, request):
         log.info("%r logged out", conn)
@@ -87,6 +93,30 @@ class Dispatcher:
 
     def _msg(self, conn, request):
         conn.send(self.router.route(conn, request))
+
+    def _create_room(self, conn, request):
+        try:
+            room = self.rooms.create(conn.user, request.payload["room"])
+        except RoomError as e:
+            conn.send(messages.error(request.seq, e.code, e.reason))
+            return
+        conn.send(messages.ack(request.seq, "CREATED", {"room": room["RoomName"], "members": [conn.user["username"]]}))
+
+    def _join(self, conn, request):
+        try:
+            room = self.rooms.join(conn.user, request.payload["room"])
+        except RoomError as e:
+            conn.send(messages.error(request.seq, e.code, e.reason))
+            return
+        conn.send(messages.ack(request.seq, "JOINED", {"room": room["RoomName"], "members": self.rooms.members(room)}))
+
+    def _leave(self, conn, request):
+        try:
+            room = self.rooms.leave(conn.user, request.payload["room"])
+        except RoomError as e:
+            conn.send(messages.error(request.seq, e.code, e.reason))
+            return
+        conn.send(messages.ack(request.seq, "LEFT", {"room": room["RoomName"]}))
 
     def _end_session(self, conn):
         if conn.user is not None:

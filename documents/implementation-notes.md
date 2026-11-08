@@ -9,9 +9,9 @@ This file tracks those differences. Update it whenever the code and the SAD disa
 ### Planned for later sprints (not deviations, just not built yet)
 | SAD item | Status | Issue |
 |---|---|---|
-| TLS 1.2+ with a pinned server certificate | Plain TCP for now. All framing and validation is already in place on top of the socket. | #11 |
+| TLS 1.2+ with a pinned server certificate | Done in Sprint 2 (PR #24). | #11 |
 | Session idle timeout and sweeper | The token is checked on every request; idle expiry is not enforced yet. | #11 |
-| Chat rooms, presence events, join/leave notifications | MSG supports `to` (direct messages). `room` is validated but answered with `NOT_FOUND` until rooms exist. | #8 |
+| Chat rooms, presence events, join/leave notifications | Done in Sprint 2. | #8 |
 | Message persistence and history | Messages are delivered but not stored. | #9 |
 | Admin service and audit log with redaction | Security events go to the rotating server log; passwords and tokens are never written. | #10 |
 
@@ -28,6 +28,16 @@ This file tracks those differences. Update it whenever the code and the SAD disa
 | D8 | Not specified | Usernames: 3-32 of `A-Z a-z 0-9 _ . -`; passwords 8-128 characters at registration; room names 1-32 of letters, digits, spaces, `_ . -`. | The SRS asks for "valid account information" without defining it. |
 | D9 | Error codes table | `REGISTER`/`LOGIN` while already logged in returns `FORBIDDEN`. | Uses an existing code; no new codes were added. |
 
+## Sprint 2
+
+### Differences from the SAD
+| # | SAD says | Implementation | Why |
+|---|---|---|---|
+| D10 | RoomMember has a Status column | No Status column: a row means "is a member" and leaving deletes the row. | Membership has only two states, so a row's presence is enough. |
+| D11 | Not specified | The `LOGIN` ACK also returns `online` (users online now) and `rooms` (every room with its member count and whether you are in it). | The client needs both to draw its sidebar; the SAD has no separate list request. |
+| D12 | Room Status OPEN / RESTRICTED / REMOVED | RESTRICTED rooms are read-only and closed to new members for everyone except administrators. REMOVED rooms behave as if they do not exist. | The SAD names the states without defining them. |
+| D13 | Not specified | A room creator becomes its first member. A server holds at most `max_rooms` rooms; the next `CREATE_ROOM` gets `FORBIDDEN`. Room names are unique ignoring case. | Matches the `max_rooms` setting and the username rule (D6). |
+
 ## Protocol summary (as implemented)
 Every frame is a 4-byte big-endian length followed by a UTF-8 JSON object, at most `max_frame_bytes`.
 
@@ -36,10 +46,20 @@ Client requests: `{"type", "seq", "payload", "session"}`. `session` is required 
 | Request | Payload | Success reply |
 |---|---|---|
 | `REGISTER` | `username`, `password` | `ACK REGISTERED` |
-| `LOGIN` | `username`, `password` | `ACK LOGGED_IN {session, username, role}` |
+| `LOGIN` | `username`, `password` | `ACK LOGGED_IN {session, username, role, online, rooms}` |
 | `MSG` | `to`, `text` | `ACK DELIVERED {to, ts}` or `ACK NOT_DELIVERED {to, ts, reason}` |
+| `MSG` | `room`, `text` | `ACK DELIVERED {room, ts, delivered_to}` or `ACK NOT_DELIVERED {room, ts, reason}`; `FORBIDDEN` if not a member |
+| `CREATE_ROOM` | `room` | `ACK CREATED {room, members}` |
+| `JOIN` | `room` | `ACK JOINED {room, members}` |
+| `LEAVE` | `room` | `ACK LEFT {room}` |
 | `LOGOUT` | none | `ACK LOGGED_OUT`, then the server closes the connection |
 | `PING` | none | `PONG` |
 
-The recipient gets `EVENT {kind: "msg", data: {from, to, seq, text, ts}}`.
+The recipient gets `EVENT {kind: "msg", data: {from, to, seq, text, ts}}`, or `{from, room, seq, text, ts}`
+for a room message.
+
+Other events:
+- `presence {user, status: online|offline}` goes to everyone online.
+- `room {action: created, room}` goes to everyone online.
+- `join {room, user}` and `leave {room, user}` go to the room's other online members.
 Errors are `ERROR {ref_seq, code, reason}` with the codes from the SAD.
