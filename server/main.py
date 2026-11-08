@@ -6,21 +6,28 @@ import os
 import sys
 
 from server.app import ChatServer
+from server.audit.audit_logger import RedactionFilter
 from server.config import ConfigError, load_config
 
 log = logging.getLogger("server")
 
 
 def configure_logging(config):
+    """Rotating log file plus console, both with password/token redaction (CHAT-SR-005)."""
+    if os.name == "posix":
+        os.umask(0o077)  # log files and the database are readable by the server account only
     os.makedirs(os.path.dirname(config["log_path"]), exist_ok=True)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     file_handler = logging.handlers.RotatingFileHandler(
         config["log_path"], maxBytes=1_000_000, backupCount=5, encoding="utf-8")
+    if os.name == "posix":
+        os.chmod(config["log_path"], 0o600)
     console = logging.StreamHandler()
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     for handler in (file_handler, console):
         handler.setFormatter(fmt)
+        handler.addFilter(RedactionFilter())
         root.addHandler(handler)
 
 

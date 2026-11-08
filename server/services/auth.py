@@ -31,18 +31,19 @@ def hash_password(password, salt):
 
 
 class AuthService:
-    def __init__(self, repo):
+    def __init__(self, repo, audit):
         self.repo = repo
+        self.audit = audit
         self._dummy_salt = os.urandom(SALT_BYTES)
 
     def register(self, username, password):
         salt = os.urandom(SALT_BYTES)
         try:
-            self.repo.create_user(username, hash_password(password, salt), salt)
+            user_id = self.repo.create_user(username, hash_password(password, salt), salt)
         except DuplicateError:
-            log.info("registration refused for %r: username taken", username)
+            self.audit.record("register", "refused: username taken", entity=username)
             raise AuthError(messages.DUPLICATE, "that username is already taken") from None
-        log.info("registered user %r", username)
+        self.audit.record("register", "success", user_id=user_id, entity=username)
 
     def authenticate(self, username, password):
         """Return the user record, or raise AuthError(AUTH_FAILED)."""
@@ -55,6 +56,8 @@ class AuthService:
         elif user["Status"] != "ACTIVE":
             reason = f"account {user['Status'].lower()}"
         else:
+            self.audit.record("login", "success", user_id=user["UserID"], entity=user["Username"])
             return user
         log.warning("login failed for %r: %s", username, reason)
+        self.audit.record("login", f"failed: {reason}", user_id=user["UserID"] if user else None, entity=username)
         raise AuthError(messages.AUTH_FAILED, "invalid username or password")

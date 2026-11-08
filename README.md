@@ -52,6 +52,17 @@ python -m client.main                 # start a client (connects to 127.0.0.1:50
 python -m client.main --host 192.168.1.20 --port 5050
 ```
 
+## Administration
+Run these on the server machine, from the project root:
+```
+python -m server.manage make-admin alice     # give alice the administrator role (next login)
+python -m server.manage remove-admin alice
+python -m server.manage audit --limit 50     # latest audit log entries
+```
+An administrator can then type commands into the client's message box, for example
+`/admin deactivate bob`, `/admin restrict_room general` or `/admin rename_room general lobby`.
+Type `/admin` on its own for the list.
+
 ## Tests
 ```
 pytest
